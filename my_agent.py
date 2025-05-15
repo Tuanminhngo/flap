@@ -1,8 +1,12 @@
+import random
 import numpy as np
 import pygame
+import torch
 from pytorch_mlp import MLPRegression
 import argparse
 from console import FlappyBirdEnv
+from collections import deque
+
 
 STUDENT_ID = 'a1234567'
 DEGREE = 'UG'  # or 'PG'
@@ -18,46 +22,123 @@ class MyAgent:
             self.mode = mode
 
         # modify these
-        self.storage = ...  # a data structure of your choice (D in the Algorithm 2)
-        # A neural network MLP model which can be used as Q
-        self.network = MLPRegression(input_dim=..., output_dim=..., learning_rate=...)
-        # network2 has identical structure to network1, network2 is the Q_f
-        self.network2 = MLPRegression(input_dim=..., output_dim=..., learning_rate=...)
-        # initialise Q_f's parameter by Q's, here is an example
+        self.storage = deque(maxlen=10000)  # experience replay buffer (D in Algorithm 2)
+        self.action_list = []  # to store ordered list of valid actions
+
+        # Assuming state has 4 features (e.g., bird position, velocity, etc.) and 2 actions (flap or not)
+        self.network = MLPRegression(input_dim=4, output_dim=2, learning_rate=0.001)
+        self.network2 = MLPRegression(input_dim=4, output_dim=2, learning_rate=0.001)
+
+        # initialise Q_f's parameter by Q's
         MyAgent.update_network_model(net_to_update=self.network2, net_as_source=self.network)
 
-        self.epsilon = ...  # probability ε in Algorithm 2
-        self.n = ...  # the number of samples you'd want to draw from the storage each time
-        self.discount_factor = ...  # γ in Algorithm 2
+        self.epsilon = 1.0          # ε for exploration, decayed over time
+        self.n = 32                 # batch size for experience replay
+        self.discount_factor = 0.99  # γ in Algorithm 2
 
         # do not modify this
         if load_model_path:
             self.load_model(load_model_path)
-
-    def choose_action(self, state: dict, action_table: dict) -> int:
+            
+    def build_state(self, state: dict) -> np.ndarray:
         """
-        This function should be called when the agent action is requested.
+        Convert the state dictionary into a feature vector.
         Args:
             state: input state representation (the state dictionary from the game environment)
-            action_table: the action code dictionary
         Returns:
-            action: the action code as specified by the action_table
+            phi_t: feature vector (numpy array)
         """
-        # following pseudocode to implement this function
-        a_t = ...
+        bird = state.get('bird', {})
+        pipe = state.get('pipe', {})
 
-        return a_t
+        bird_y = bird.get('y', 0.0)
+        bird_velocity = bird.get('velocity', 0.0)
+        pipe_x = pipe.get('x', 0.0)
+        pipe_height = pipe.get('height', 0.0)
+
+        # Convert to numpy feature vector
+        phi_t = np.array([bird_y, bird_velocity, pipe_x, pipe_height], dtype=np.float32)
+        return phi_t
+
+    
+    def choose_action(self, state: dict, action_table: dict) -> int:
+        phi_t = self.build_state(state)
+
+        # Exclude 'quit_game' from learning
+        if not self.action_list:
+            self.action_list = [action_table['do_nothing'], action_table['jump']]
+
+        if self.mode == 'train' and np.random.rand() < self.epsilon:
+            action_index = np.random.randint(len(self.action_list))
+        else:
+            q_values = self.network.predict(phi_t.reshape(1, -1))
+            action_index = np.argmax(q_values)
+
+        action_code = self.action_list[action_index]
+
+        if self.mode == 'train':
+            self.storage.append([phi_t, action_index, None, None])  # only 0 or 1
+
+        return action_code
 
     def receive_after_action_observation(self, state: dict, action_table: dict) -> None:
-        """
-        This function should be called to notify the agent of the post-action observation.
-        Args:
-            state: post-action state representation (the state dictionary from the game environment)
-            action_table: the action code dictionary
-        Returns:
-            None
-        """
-        # following pseudocode to implement this function
+        if self.mode != 'train' or len(self.storage) == 0:
+            return
+
+        # Get the last stored transition (phi_t, a_t, _, _)
+        phi_t, a_t, _, _ = self.storage[-1]
+
+        # Build next state representation
+        phi_t_next = self.build_state(state)
+
+        # Calculate reward
+        reward = state.get('score', 0)
+        if state.get('done', False):
+            if state.get('score', 0) >= state.get('target_score', float('inf')):
+                reward += 10
+            else:
+                reward -= 10
+
+        # Update the transition
+        self.storage[-1] = (phi_t, a_t, reward, phi_t_next)
+
+        # Only train if enough samples
+        if len(self.storage) >= self.n:
+            batch = random.sample(self.storage, self.n)
+
+            # Extract from batch
+            phi_batch = np.vstack([t[0] for t in batch])
+            a_batch = [t[1] for t in batch]
+            r_batch = [t[2] for t in batch]
+            q_next_batch = np.array([self.network2.predict(t[3]) for t in batch], dtype=np.float32)
+
+            # Build action mapping (action_code → index)
+            if isinstance(action_table, dict):
+                action_values = sorted(action_table.values())
+            else:
+                action_values = sorted(action_table)
+
+            action_to_index = {v: i for i, v in enumerate(action_values)}
+            action_indices = np.array([action_to_index.get(a, 0) for a in a_batch], dtype=np.int32)
+
+            # Predict Q(s, ·)
+            q_pred = self.network.predict(phi_batch)
+            targets = q_pred.copy()
+            for i in range(self.n):
+                targets[i, action_indices[i]] = r_batch[i] + self.discount_factor * np.max(q_next_batch[i])
+
+            # Build weight mask: only update chosen action
+            weights = np.zeros_like(targets)
+            for i in range(self.n):
+                weights[i, action_indices[i]] = 1.0
+
+            # Train using fit_step (no direct model access)
+            self.network.fit_step(phi_batch, targets, weights)
+
+            # Epsilon decay
+            self.epsilon = max(0.1, self.epsilon * 0.95)
+
+
 
     def save_model(self, path: str = 'my_model.ckpt'):
         """
